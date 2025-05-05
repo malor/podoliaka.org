@@ -1,0 +1,66 @@
+Talks
+=====
+
+2018
+----
+
+- *Continuous Integration*: [slides][ci_slides], [video][ci_video]
+
+[ci_slides]: openstackci/slides.pdf
+[ci_video]: https://www.youtube.com/watch?v=25cQ910pyGM
+
+2017
+----
+
+- *Machine Learning 101* at [KharkivPy] #17: [video][ml101_video], [slides][ml101_slides], [code][ml101_code]
+
+[ml101_video]: https://www.youtube.com/watch?v=RtgpPMZu_TY
+[ml101_slides]: http://nbviewer.jupyter.org/format/slides/github/malor/machine-learning-101/blob/master/index.ipynb#/
+[ml101_code]: https://github.com/malor/machine-learning-101
+
+- *Debugging CPython processes with gdb* at [KharkivPy] #15: [video][gdbdebugging_video_kharkivpy], [slides][gdbdebugging_slides_kharkivpy]
+
+[gdbdebugging_video_kharkivpy]: https://www.youtube.com/watch?v=3h4-XTYQhWc
+[gdbdebugging_slides_kharkivpy]: http://www.slideshare.net/amd4ever/debugging-of-cpython-applications-71486119
+
+2016
+----
+
+- *Switching to the new EngineFacade*: [slides][enginefacade_slides]
+
+[enginefacade_slides]: http://www.slideshare.net/amd4ever/switching-to-the-new-enginefacade
+
+
+- *Debugging CPython processes with gdb* at [PyCon PL] 2016: [slides][gdbdebugging_slides], [video][gdbdebugging_video]
+
+[gdbdebugging_slides]: http://www.slideshare.net/amd4ever/slides-67126020
+[gdbdebugging_video]: https://www.youtube.com/watch?v=VIhT_XzWnl0
+
+
+- *Python automated testing 101*: [slides][automated_testing_slides]
+
+[automated_testing_slides]: autotesting/slides.pdf
+
+
+- *CPU profiling of Python applications* at [PyCon UA] 2016: [video][profiling_video_uapycon], [slides][profiling_slides_uapycon]
+
+[profiling_video_uapycon]: https://www.youtube.com/watch?v=nW3nN7mbdG0
+[profiling_slides_uapycon]: profiling/slides.pdf
+
+
+- *CPU profiling of Python applications* at [KharkivPy] #12 (Kharkiv, Ukraine): [video][profiling_video], [slides][profiling_slides]
+
+[profiling_video]: https://www.youtube.com/watch?v=KcvsJ1jvirA
+[profiling_slides]: https://www.dropbox.com/s/8wdev9or47pdnq7/kharkivpy-profiling.tar.gz?dl=1
+
+2015
+----
+
+- *Debugging (C)Python applications* at [KharkivPy] #11 (Kharkiv, Ukraine): [video][debugging_video], [slides][debugging_slides]
+
+[debugging_video]: https://www.youtube.com/watch?v=Yi1VuXjWV2E
+[debugging_slides]: https://www.dropbox.com/s/bjowr0j4vck6ijy/kharkivpy-debugging.pdf?dl=1
+
+[KharkivPy]: http://kharkivpy.org.ua/
+[PyCon UA]: http://ua.pycon.org/
+[PyCon PL]: https://pl.pycon.org/

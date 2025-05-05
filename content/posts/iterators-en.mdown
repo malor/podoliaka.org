@@ -1,0 +1,407 @@
++++
+title = "Iterators for Beginners. The Way of С++"
+date = 2013-01-20
+draft = false
+tags = ["c++"]
++++
+
+This post is mainly for beginners and is not intended to teach you everything
+about iterators in C++. So if you know about `iterator_traits<>` or advanced concepts
+like that, you will not learn anything new. Anyway, I hope this information will be
+useful for people who haven't used C++ iterators before.
+
+The problem
+-----------
+
+Lets consider the following example: we need a function that would return an index of
+the maximum element in a given array of integers. We could implement it like this:
+
+```cpp
+int max_element(int arr[], int len)
+{
+   int max = 0;
+
+   for (int i = 1; i < len; ++i)
+   {
+       if (arr[i] > arr[max])
+           max = i;
+   }
+
+   return max;
+}
+```
+
+This code does the trick but it has a huge limitation: it only works for arrays of `int` elements.
+To find the maximum element in an array of floats we would have to write exactly the same code and
+substitute `int` with `float` in the declaration of an array type. C++ has a solution for this
+problem — *function templates*.
+
+A generalized version of a function that returns an index of the maximum element in an array of
+ _any_ type (or, to be precise, any type for which the relation *"greater than"* is defined) would
+look like:
+
+```cpp
+template<class T>
+int max_element(T arr[], int len)
+{
+    int max = 0;
+
+    for (int i = 1; i < len; ++i)
+    {
+        if (arr[i] > arr[max])
+            max = i;
+    }
+
+    return max;
+}
+```
+
+Now we must be satisfied. But what if we wanted to search for the maximum element only in a small
+part of an array?
+
+Arrays in C++ are linearly allocated memory segments filled with elements of some type with no gaps
+between them. Moreover, an array name is also a pointer to the first element of this array. Arrays and
+pointers have much in common and, as you may already know, it is perfectly fine to use pointer
+arithmetic to access array elements.
+
+For a generic data processing function, the operating _range_ can be specified by a pair of pointers:
+
+* The first one points to the *first* element to process ("begin")
+* The second one points to the *next after the last* element to process ("end")
+
+So why have we chosen a half open range `[begin; end)`? This will allow us to write down the loop
+termination condition in a very clear and obvious way:
+
+```cpp
+template<class T>
+const T* max_element(const T* begin, const T* end)
+{
+    const T* max = begin;
+
+    for (++begin; begin != end; ++begin)
+    {
+        if (*begin > * max)
+            max = begin;
+    }
+
+    return max;
+}
+```
+
+If implemented like that, `max_element()` can be called for any contiguous range of elements of
+an array:
+
+```cpp
+int array[] = {1, 2, 3, 4, 5, 6};
+
+int max = max_element(array, array + 6);
+int max_of_first3 = max_element(array, array + 3);
+```
+
+Can we do even better?
+----------------------
+
+Our generalized function works great for arrays of any type, but arrays have a few drawbacks:
+one can't resize an existing array, one can't push a new element to the front of an array, etc.
+It would be great to use the same code for searching for the maximum element in different kinds
+of data structures, e. g. in a [linked list](http://en.wikipedia.org/wiki/Linked_list).
+
+But elements of a linked list aren't allocated linearly in memory — they are separate chunks of
+memory connected with each other using pointers (*links*). That means we can't use our function
+anymore, because the way we access data structure elements has changed, though the algorithm itself
+remains completely the same: visit all the elements one after another and compare each one with the
+current maximum element.
+
+What really has changed is the way we access the elements of a data structure. For arrays we could
+use pointer arithmetic to calculate the address of an element we want (`base address + index * sizeof(T)`).
+But to access the `i`-th element of a linked list we need to follow the links starting from head.
+
+So here is the problem with our function: **the way we access elements of a data structure
+is tightly coupled with the algorithm the function implements**. This means we have to write
+a separate version of our function for all data structures we want to use it for. And we all
+know that code duplication leads to errors and complicates refactoring.
+
+To solve this problem we have to decouple the algorithm from a data structure it processes.
+
+Lets have another look at our function:
+
+```cpp
+template<class T>
+const T* max_element(const T* begin, const T* end)
+{
+    const T* max = begin;
+
+    for (++begin; begin != end; ++begin)
+    {
+        if (*begin > * max)
+            max = begin;
+    }
+
+    return max;
+}
+```
+
+How do we access the elements of an array?
+
+1. `*` – *dereference a pointer* – get the value of an element referenced by the pointer.
+2. `!=` – *not equal* – compare two pointers (to detect the end of a range).
+3. `++` – *increment a pointer* – move the pointer to the next element of an array.
+
+If we pass some _objects_ to `max_element()` instead of passing raw pointers,
+we can define the operations above in a way that they implement the logic of
+accessing elements of different data structures (e.g. a linked list).
+
+It is easy to do using C++ templates and operator overloading. The final version of our
+function looks like this:
+
+```cpp
+template<class Iterator>
+Iterator max_element(Iterator begin, Iterator end)
+{
+    Iterator max = begin;
+
+    for (++begin; begin != end; ++begin)
+    {
+        if (*begin > * max)
+            max = begin;
+    }
+
+    return max;
+}
+```
+
+Here we use objects of the type `Iterator` instead of raw pointers. But what _is_ an iterator?
+
+An **iterator** is a special object which allows one to access a data structure elements without
+exposing its internal implementation. One works with a data structure via the well defined abstract
+interface.
+
+C++ iterators happen to use pointer semantics as their interface, but that's just an implementation
+detail. It is important that all containers provide iterators with the same interface.
+Users work with containers using iterators and do not know anything about how those containers are
+actually implemented. This is the way algorithms and data structures are decoupled — one can use
+the same algorithm for different data structures without changing the code.
+
+Your first iterator
+-------------------
+
+Consider the simplest implementation of a singly linked list. The implementation of a list node:
+
+```cpp
+#ifndef __LIST_NODE_H__
+#define __LIST_NODE_H__
+
+template<class T>
+struct Node
+{
+    T data;
+    Node<T>* next;
+};
+
+#endif /* __LIST_NODE_H__ */
+```
+
+The implementation of a list container:
+
+```cpp
+#ifndef __LINKED_LIST_H__
+#define __LINKED_LIST_H__
+
+#include "list_node.h"
+#include "list_iterator.h"
+
+template<class T>
+class LinkedList
+{
+public:
+    LinkedList();
+    ~LinkedList();
+
+    ListIterator<T> begin() const;
+    ListIterator<T> end() const;
+
+    void push_front(const T& elem);
+    void push_back(const T& elem);
+
+private:
+    Node<T>* _head;
+    Node<T>* _tail;
+};
+
+template<class T>
+LinkedList<T>::LinkedList()
+    : _head(0), _tail(0)
+{ }
+
+template<class T>
+LinkedList<T>::~LinkedList()
+{
+    while (_head)
+    {
+        Node<T>* next = _head->next;
+        delete _head;
+        _head = next;
+    }
+}
+
+template<class T>
+void LinkedList<T>::push_front(const T& elem)
+{
+    if (!_head)
+    {
+        _head = new Node<T>;
+        _head->data = elem;
+        _head->next = 0;
+
+        _tail = _head;
+    }
+    else
+    {
+        Node<T>* oldfirst = _head;
+
+        _head = new Node<T>;
+        _head->data = elem;
+        _head->next = oldfirst;
+    }
+}
+
+template<class T>
+void LinkedList<T>::push_back(const T& elem)
+{
+    if (!_tail)
+    {
+        _tail = new Node<T>;
+        _tail->data = elem;
+        _tail->next = 0;
+
+        _head = _tail;
+    }
+    else
+    {
+        Node<T>* oldlast = _tail;
+
+        _tail = new Node<T>;
+        _tail->data = elem;
+        _tail->next = 0;
+
+        oldlast->next = _tail;
+    }
+}
+
+template<class T>
+ListIterator<T> LinkedList<T>::begin() const
+{
+    return ListIterator<T>(_head);
+}
+
+template<class T>
+ListIterator<T> LinkedList<T>::end() const
+{
+    return ListIterator<T>(0);
+}
+
+#endif /* __LINKED_LIST_H__ */
+```
+
+We have implemented a minimal set of methods:
+
+* Data structure allocation/initialization and destruction/deallocation — `LinkedList()`, `~LinkedList()`
+* Adding elements to the front and to the back of a list — `push_front()`, `push_back()`
+* Access the elements — methods that return iterators which point to the first and to the last elements
+  the list — `begin()`, `end()`.
+
+Using the iterators returned by `begin()/end()` one can access all the elements of a list.
+A possible implementation of an iterator for a linked list data structure is provided below:
+
+```cpp
+#ifndef __LIST_ITERATOR_H__
+#define __LIST_ITERATOR_H__
+
+template<class T>
+class ListIterator
+{
+public:
+    ListIterator(Node<T>* node);
+
+    const Node<T>* node() const;
+
+    ListIterator<T>& operator++();
+    const T& operator*() const;
+    bool operator!=(const ListIterator<T>& it) const;
+
+private:
+    Node<T>* _currentNode;
+};
+
+template<class T>
+ListIterator<T>::ListIterator(Node<T>* node)
+    : _currentNode(node)
+{ }
+
+template<class T>
+const Node<T>* ListIterator<T>::node() const
+{
+    return _currentNode;
+}
+
+template<class T>
+ListIterator<T>& ListIterator<T>::operator++()
+{
+    _currentNode = _currentNode->next;
+    return *this;
+}
+
+template<class T>
+const T& ListIterator<T>::operator*() const
+{
+    return _currentNode->data;
+}
+
+template<class T>
+bool ListIterator<T>::operator!=(const ListIterator<T>& it) const
+{
+    return _currentNode != it.node();
+}
+
+#endif /* __LIST_ITERATOR_H__ */
+```
+
+An iterator instance is initialized using a pointer to a linked list node. Overloaded operators
+implement the logic of accessing list nodes and the values they contain.
+
+Lets have a look at how our function for returning of an iterator which points to the maximum
+element of a given data structure works for both arrays and linked lists:
+
+```cpp
+LinkedList<int> l;
+l.push_front(1);
+l.push_back(2);
+l.push_back(3);
+l.push_back(10);
+l.push_back(4);
+l.push_front(5);
+
+int arr[] = {1, 2, 3, 10, 4, 5};
+
+std::cout << "Max in list: "  << *max_element(l.begin(), l.end()) << " ";
+std::cout << "Max in array: " << *max_element(arr, arr + 6) << " ";
+```
+
+Conclusion
+----------
+
+This is only a small part of what you need to know about iterators. We have covered one particular
+kind of iterators called **Forward Iterators** that allow traversing ranges by moving forwards
+(using the `++` operator). There are other kinds of iterators, e.g. **Bidirectional Iterators**,
+that allow traversing ranges in the opposite direction as well (`++`, `!=`, `*` operators are
+suplemented with the `--` operator), and more.
+
+C++ iterators use pointer semantics as their interface, but it is just an implementation detail —
+any other interface could have been chosen instead. But the this implementation enables using
+raw pointers as array iterators.
+
+Iterators are a very important part of STL because they decouple algorithms from data structures
+those algorithms operate on. This way algorithms can be generalized to work with any data structure
+as long as it implements the required kind of iterators.
+
+The source code of code snippets is available on [GitHub](https://github.com/malor/archive/tree/main/iterators-source).

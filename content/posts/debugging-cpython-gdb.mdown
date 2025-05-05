@@ -1,0 +1,714 @@
++++
+title = "Debugging CPython processes with gdb"
+date = 2016-04-10
+draft = false
+tags = ["python", "debugging"]
++++
+
+[pdb] has been, is and probably always will be the bread and butter of Python
+programmers when they need to find the root cause of a problem in their
+applications — it's a built-in and easy to use debugger. But there are cases
+when pdb can't help you, e.g. if your app is stuck somewhere, and you
+want to attach to a running process to find out why, without restarting it.
+This is where [gdb] shines.
+
+[pdb]: https://docs.python.org/3.5/library/pdb.html
+[gdb]: https://www.gnu.org/software/gdb/
+
+
+Why gdb?
+--------
+
+gdb is a general purpose debugger that is mostly used for debugging C and
+C++ applications (although it actually supports Ada, Objective-C, Pascal and
+many other languages).
+
+There are different reasons why a Python programmer would be interested in gdb
+for debugging:
+
+* gdb allows attaching to a running process without starting the app
+in the debug mode or modifying the source code (e.g. adding something like
+`import rpdb; rpdb.set_trace()`)
+
+* gdb allows taking a [core dump] of a process and analyzing it later.
+This is useful when you don't want to stop the process while you are introspecting
+its state, as well as when you perform [post-mortem] debugging of a process that has
+already failed (e.g. [crashed] with a segmentation fault)
+
+* Most debuggers available for Python (notable exceptions are [winpdb] and [pydevd])
+do not support switching between threads of the application being debugged. gdb
+allows that, as well as debugging threads created by non-Python code (e.g. in a
+native library)
+
+[core dump]: https://en.wikipedia.org/wiki/Core_dump
+[post-mortem]: https://en.wikipedia.org/wiki/Debugging#Techniques
+[crashed]: https://www.freedesktop.org/software/systemd/man/systemd-coredump.html
+[winpdb]: http://winpdb.org/
+[pydevd]: https://github.com/fabioz/PyDev.Debugger
+
+
+Debugging of interpreted languages
+----------------------------------
+
+So what makes Python special when using gdb?
+
+Unlike with programming languages like C or C++, Python code is _not_
+compiled into a native binary for a target platform. Instead, there is an
+interpreter (e.g.  [CPython], the reference implementation of Python) which
+executes compiled [byte-code].
+
+This effectively means that when you attach to a Python process with gdb,
+you will be debugging the interpreter instance and introspecting the process state
+at the interpreter rather than the application level, i.e. you will see functions
+and variables of the interpreter, not of your app.
+
+To give you an example, let's take a look at the gdb backtrace of a CPython process:
+
+```text
+#0  0x00007fcce9b2faf3 in __epoll_wait_nocancel () at ../sysdeps/unix/syscall-template.S:81
+#1  0x0000000000435ef8 in pyepoll_poll (self=0x7fccdf54f240, args=<optimized out>, kwds=<optimized out>) at ../Modules/selectmodule.c:1034
+#2  0x000000000049968d in call_function (oparg=<optimized out>, pp_stack=0x7ffc20d7bfb0) at ../Python/ceval.c:4020
+#3  PyEval_EvalFrameEx () at ../Python/ceval.c:2666
+#4  0x0000000000499ef2 in fast_function () at ../Python/ceval.c:4106
+#5  call_function () at ../Python/ceval.c:4041
+#6  PyEval_EvalFrameEx () at ../Python/ceval.c:2666
+```
+
+and the one obtained by calling `traceback.extract_stack()` in Python:
+
+```text
+/usr/local/lib/python2.7/dist-packages/eventlet/greenpool.py:82 in _spawn_n_impl
+    `func(*args, **kwargs)`
+
+/opt/stack/neutron/neutron/agent/l3/agent.py:461 in _process_router_update
+    `for rp, update in self._queue.each_update_to_next_router():`
+
+/opt/stack/neutron/neutron/agent/l3/router_processing_queue.py:154 in each_update_to_next_router
+    `next_update = self._queue.get()`
+
+/usr/local/lib/python2.7/dist-packages/eventlet/queue.py:313 in get
+    `return waiter.wait()`
+
+/usr/local/lib/python2.7/dist-packages/eventlet/queue.py:141 in wait
+   `return get_hub().switch()`
+
+/usr/local/lib/python2.7/dist-packages/eventlet/hubs/hub.py:294 in switch
+    `return self.greenlet.switch()`
+```
+
+As is, the former is of little help when you are trying to find a problem
+in your Python code, and all you see is the current state of the interpreter
+itself.
+
+However, the [PyEval_EvalFrameEx] function looks interesting: in CPython
+it executes the bytecode of Python application level functions and, thus,
+has access to their state — the very state we are interested in.
+
+[CPython]: https://en.wikipedia.org/wiki/CPython
+[byte-code]: http://security.coverity.com/blog/2014/Nov/understanding-python-bytecode.html
+[PyEval_EvalFrameEx]: https://docs.python.org/2/c-api/veryhigh.html#c.PyEval_EvalFrameEx
+
+
+gdb and Python
+--------------
+
+Search results for `"gdb debug python"` can be confusing. Starting from gdb version 7,
+it's been possible to [extend] it with Python code, e.g. to provide visualisations for C++
+[STL] types — it is much easier to implement that in Python rather than in the built-in
+[macro] language.
+
+To be able to debug Python programs and introspect the application level state, CPython
+developers decided to extend gdb and wrote a [script] for that in... Python, of course!
+
+So those are two different but related things:
+
+* gdb versions 7+ are extendable with Python
+* There's a Python gdb extension for debugging CPython processes
+
+[extend]: https://sourceware.org/gdb/current/onlinedocs/gdb/Python.html#Python
+[STL]: https://sourceware.org/gdb/wiki/STLSupport
+[macro]: http://www.ibm.com/developerworks/aix/library/au-gdb.html
+[script]: https://github.com/python/cpython/blob/master/Tools/gdb/libpython.py
+
+
+Debugging Python with gdb 101
+-----------------------------
+
+First of all, you need to install gdb:
+
+```shell
+sudo apt-get install gdb
+```
+
+or
+
+```shell
+sudo yum install gdb
+```
+
+depending on the Linux distro you are using.
+
+The next step is to install [debugging symbols] for the CPython build you have:
+
+```shell
+sudo apt-get install python-dbg
+```
+
+or
+
+```shell
+sudo yum install python-debuginfo
+```
+
+Some Linux distros like CentOS or RHEL ship debugging symbols [separately] from
+all other packages and recommend to install those like:
+
+
+```shell
+sudo debuginfo-install python
+```
+
+The installed debugging symbols will be used by CPython's [script] for gdb
+to analyze `PyEval_EvalFrameEx` frames (a _frame_ is a function call and its
+associated state in the form of local variable and CPU register values)
+and map those to application level functions in your code.
+
+Without debugging symbols it is much harder to do — gdb allows you to
+manipulate the process memory in any way you want, but you can't easily
+understand what data structures reside in what memory areas.
+
+After all the preparatory steps have been completed, you can finally
+give gdb a try. To attach to a running CPython process, do:
+
+```shell
+gdb /usr/bin/python -p $PID
+```
+
+At this point, you can get an application level backtrace for the current
+thread (note, that some frames are "missing" — this is expected, as gdb
+counts all the interpreter level frames and only some of those will correspond
+to calls in the application code — the `PyEval_EvalFrameEx` calls):
+
+```text
+(gdb) py-bt
+
+#4 Frame 0x1b7da60, for file /usr/lib/python2.7/sched.py, line 111, in run (self=<scheduler(timefunc=<built-in function time>, delayfunc=<built-in function sleep>, _queue=[<Event at remote 0x7fe1f8c74a10>]) at remote 0x7fe1fa086758>, q=[...], delayfunc=<built-in function sleep>, timefunc=<built-in function time>, pop=<built-in function heappop>, time=<float at remote 0x1a0a400>, priority=1, action=<function at remote 0x7fe1fa083aa0>, argument=(171657,), checked_event=<...>, now=<float at remote 0x1b8ec58>)
+    delayfunc(time - now)
+#7 Frame 0x1b87e90, for file /usr/bin/dstat, line 2416, in main (interval=1, user='ubuntu', hostname='rpodolyaka-devstack', key='unit_hi', linewidth=150, plugin='page', mods=('page', 'page24'), mod='page', pluginfile='dstat_page', scheduler=<scheduler(timefunc=<built-in function time>, delayfunc=<built-in function sleep>, _queue=[<Event at remote 0x7fe1f8c74a10>]) at remote 0x7fe1fa086758>)
+    scheduler.run()
+#11 Frame 0x7fe1fa0bc5c0, for file /usr/bin/dstat, line 2554, in <module> ()
+    main()
+```
+
+or find out what exact line of the application code is currently being executed:
+
+```text
+(gdb) py-list
+
+ 106            pop = heapq.heappop
+ 107            while q:
+ 108                time, priority, action, argument = checked_event = q[0]
+ 109                now = timefunc()
+ 110                if now < time:
+>111                    delayfunc(time - now)
+ 112                else:
+ 113                    event = pop(q)
+ 114                    # Verify that the event was not removed or altered
+ 115                    # by another thread after we last looked at q[0].
+ 116                    if event is checked_event:
+```
+
+or look at the values of local variables:
+
+```text
+(gdb) py-locals
+
+self = <scheduler(timefunc=<built-in function time>, delayfunc=<built-in function sleep>, _queue=[<Event at remote 0x7fe1f8c74a10>]) at remote 0x7fe1fa086758>
+q = [<Event at remote 0x7fe1f8c74a10>]
+delayfunc = <built-in function sleep>
+timefunc = <built-in function time>
+pop = <built-in function heappop>
+time = <float at remote 0x1a0a400>
+priority = 1
+action = <function at remote 0x7fe1fa083aa0>
+argument = (171657,)
+checked_event = <Event at remote 0x7fe1f8c74a10>
+now = <float at remote 0x1b8ec58>
+```
+
+There are more `py-` commands provided by the CPython [script] for gdb.
+Check out the debugging [guide] for details.
+
+[guide]: https://docs.python.org/devguide/gdb.html
+[debugging symbols]: http://www.tutorialspoint.com/gnu_debugger/gdb_debugging_symbols.htm
+[separately]: http://debuginfo.centos.org/
+[script]: https://github.com/python/cpython/blob/master/Tools/gdb/libpython.py
+
+
+Gotchas
+-------
+
+Although the described technique should work out-of-the-box, there are a few known
+gotchas.
+
+## python-dbg
+
+The `python-dbg` package in Debian and Ubuntu will not only install the
+debugging symbols for the `python` binary (which are stripped at the package
+build time to save disk space), but also provide an additional CPython binary called
+`python-dbg`.
+
+The latter essentially is a separate build of CPython (with the `--with-pydebug` flag
+passed to `./configure`) that has additional run-time checks. Generally, you don't want
+to use `python-dbg` in production, as it can be (much) slower than `python`. For instance:
+
+```shell
+$ time python -c "print(sum(range(1, 1000000)))"
+499999500000
+
+real	0m0.096s
+user	0m0.057s
+sys	0m0.030s
+
+$ time python-dbg -c "print(sum(range(1, 1000000)))"
+499999500000
+[18318 refs]
+
+real	0m0.237s
+user	0m0.197s
+sys	0m0.016s
+```
+
+The good news is that you don't need to: it's still possible to debug the (normal)
+`python` executable by the means of gdb, as long as the corresponding debugging
+symbols are installed. `python-dbg` just adds a bit more confusion to the
+CPython/gdb story, and you can safely ignore its existence.
+
+## Build flags
+
+Some Linux distros build CPython with either the `-g0`, or the `-g1` [option] passed
+to gcc: the former produces a binary without debugging information at all, and the latter
+does not allow gdb to get the information about local variables at runtime.
+
+Both of those options break the described workflow of debugging CPython processes
+by the means of gdb. The solution is to rebuild CPython with `-g` (which is the same
+as `-g2`).
+
+Fortunately, all current versions of the major Linux distros (Ubuntu Trusty/Xenial,
+Debian Jessie, CentOS/RHEL 7) ship the "correctly" built CPython.
+
+[option]: https://gcc.gnu.org/onlinedocs/gcc/Debugging-Options.html
+
+## Optimized out frames
+
+For introspection to work properly, it's crucial that the information about
+`PyEval_EvalFrameEx` arguments is preserved for each call. Depending on the
+[optimization level] used in gcc when building CPython, or the specific
+compiler version used, it's possible that this information will be lost at
+runtime (especially with aggressive optimizations enabled by `-O3`). In that
+case, gdb will show you something like:
+
+```shell
+(gdb) bt
+
+#0  0x00007fdf3ca31be3 in __select_nocancel () at ../sysdeps/unix/syscall-template.S:84
+#1  0x00000000005d1da4 in pysleep (secs=<optimized out>) at ../Modules/timemodule.c:1408
+#2  time_sleep () at ../Modules/timemodule.c:231
+#3  0x00000000004f5465 in call_function (oparg=<optimized out>, pp_stack=0x7fff62b184c0) at ../Python/ceval.c:4637
+#4  PyEval_EvalFrameEx () at ../Python/ceval.c:3185
+#5  0x00000000004f5194 in fast_function (nk=<optimized out>, na=<optimized out>, n=<optimized out>, pp_stack=0x7fff62b185c0, 
+    func=<optimized out>) at ../Python/ceval.c:4750
+#6  call_function (oparg=<optimized out>, pp_stack=0x7fff62b185c0) at ../Python/ceval.c:4677
+#7  PyEval_EvalFrameEx () at ../Python/ceval.c:3185
+#8  0x00000000004f5194 in fast_function (nk=<optimized out>, na=<optimized out>, n=<optimized out>, pp_stack=0x7fff62b186c0, 
+    func=<optimized out>) at ../Python/ceval.c:4750
+#9  call_function (oparg=<optimized out>, pp_stack=0x7fff62b186c0) at ../Python/ceval.c:4677
+#10 PyEval_EvalFrameEx () at ../Python/ceval.c:3185
+#11 0x00000000005c5da8 in _PyEval_EvalCodeWithName.lto_priv.1326 () at ../Python/ceval.c:3965
+#12 0x00000000005e9d7f in PyEval_EvalCodeEx () at ../Python/ceval.c:3986
+#13 PyEval_EvalCode (co=<optimized out>, globals=<optimized out>, locals=<optimized out>) at ../Python/ceval.c:777
+#14 0x00000000005fe3d2 in run_mod () at ../Python/pythonrun.c:970
+#15 0x000000000060057a in PyRun_FileExFlags () at ../Python/pythonrun.c:923
+#16 0x000000000060075c in PyRun_SimpleFileExFlags () at ../Python/pythonrun.c:396
+#17 0x000000000062b870 in run_file (p_cf=0x7fff62b18920, filename=0x1733260 L"test2.py", fp=0x1790190) at ../Modules/main.c:318
+#18 Py_Main () at ../Modules/main.c:768
+#19 0x00000000004cb8ef in main () at ../Programs/python.c:69
+#20 0x00007fdf3c970610 in __libc_start_main (main=0x4cb810 <main>, argc=2, argv=0x7fff62b18b38, init=<optimized out>, fini=<optimized out>, 
+    rtld_fini=<optimized out>, stack_end=0x7fff62b18b28) at libc-start.c:291
+#21 0x00000000005c9df9 in _start ()
+
+(gdb) py-bt
+Traceback (most recent call first):
+  File "test2.py", line 9, in g
+    time.sleep(1000)
+  File "test2.py", line 5, in f
+    g()
+  (frame information optimized out)
+```
+
+i.e. some application level frames will be available, and some will not.
+There is little you can do at this point, except for rebuilding CPython
+with a lower optimization level, but that often is not an option for production
+(not to mention the fact you'll be using a custom CPython build).
+
+[optimization level]: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+
+**Update**: actually, there _is_ something you could do! This `frame information optimized out`
+message simply tells you that gdb wasn't able to figure out the location of the
+``PyFrameObject`` data structure in a given stack frame (DWARF debugging symbols
+allow gdb to calculate the addresses of local variables and function arguments). But
+it has to be _somewhere_ in memory — otherwise CPython would not be able to execute
+your Python code.
+
+On x86-64 machines the obvious place to check is the CPU registers: there are 16
+general purpose CPU registers that compilers can use for storing the values of
+function call arguments and local variables.
+
+The following command prints the values of all CPU registers in the selected
+stack frame:
+
+```text
+(gdb) info registers
+rax            0xfffffffffffffdfe	-514
+rbx            0x7ffff7fd7c20	140737353972768
+rcx            0x7ffff7afaff7	140737348874231
+rdx            0x0	0
+rsi            0x0	0
+rdi            0x0	0
+rbp            0x7ffff7fd7d98	0x7ffff7fd7d98
+rsp            0x7fffffffe3c0	0x7fffffffe3c0
+r8             0x7fffffffe050	140737488347216
+r9             0x0	0
+r10            0x0	0
+r11            0x246	582
+r12            0x0	0
+r13            0x7ffff7fae050	140737353801808
+r14            0x7ffff7fae050	140737353801808
+r15            0x0	0
+rip            0x5555556468ca	0x5555556468ca <PyEval_EvalCodeEx+1754>
+eflags         0x246	[ PF ZF IF ]
+cs             0x33	51
+ss             0x2b	43
+ds             0x0	0
+es             0x0	0
+fs             0x0	0
+gs             0x0	0
+```
+
+But those are just integers. We need to tell gdb how to interpret them.
+
+Note, that some of the numbers above clearly look like memory addresses. We can ask
+gdb to interpret the value of a CPU register as a pointer to some data type. We _know_
+that most of CPython runtime data structures are `PyObject`'s which store information
+about the actual type internally (e.g. the `->ob_type->tp_name` field contains the type
+name encoded as a C-string).
+
+So what we will do is try casting the value of each CPU register to `PyObject*` and
+see if we can find anything useful:
+
+```text
+(gdb) p ((PyObject*) $rax)->ob_type->tp_name
+Cannot access memory at address 0xfffffffffffffe06
+```
+
+If we give gdb a memory address that does not actually point to a `PyObject` instance,
+we will get an error on pointer dereference.
+
+There are only so many CPU registers to check. And you can easily automate this search by the
+means of a helper gdb command similar to:
+
+```python
+class LocatePyFrameObject(gdb.Command):
+    'Locate the CPU register that contains the value of PyFrameObject* in the selected stack frame'
+
+    REGISTERS = (
+        # x86-64 registers, that can be used for storing of local variables and function arguments
+        'rax', 'rbx', 'rcx', 'rdx',
+        'rsi', 'rdi',
+        'rbp', 'rsp',
+        'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15',
+    )
+
+    def __init__(self):
+        super(LocatePyFrameObject, self).__init__(
+            'py-locate-frame',
+            gdb.COMMAND_DATA,
+            gdb.COMPLETE_NONE
+        )
+
+    def invoke(self, args, from_tty):
+        gdb_type = PyObjectPtr.get_gdb_type()
+        frame = gdb.selected_frame()
+
+        for register in self.REGISTERS:
+            try:
+                value = frame.read_register(register).cast(gdb_type)
+                if value['ob_type']['tp_name'].string() == 'frame':
+                    print(register)
+                    return
+            except gdb.MemoryError:
+                # if either cast or pointer dereference fails, then it's not a valid PyFrameObjectPtr*
+                continue
+
+LocatePyFrameObject()
+```
+
+E.g., my CPython build puts the pointer to ``PyFrameObject`` to the CPU register RBX:
+
+```text
+(gdb) py-locate-frame
+rbx
+
+(gdb) p ((PyObject*) $rbx)->ob_type->tp_name
+$28 = 0x5555557472ef "frame"
+
+(gdb) p (PyFrameObject*) $rbx
+$29 = Frame 0x7ffff7fd7c20, for file test2.py, line 12, in <module> ()
+
+(gdb) p (PyObject*) $rbx
+$30 = Frame 0x7ffff7fd7c20, for file test2.py, line 12, in <module> ()
+```
+
+Note, that `libpython-gdb.py` enables pretty-printing of the `PyFrameObject`
+structure, as well it is able to figure out a specific type of a given `PyObject`
+automatically. So even if high-level commands like `py-bt` do not work on such stack
+frames, you will be able to get the very same information by pointing gdb to the
+location of `PyFrameObject` manually.
+
+Of course, manually poking CPU registers and memory addresses is not pretty,
+but it can be the only way of debugging "optimized out" frames.
+
+
+## Virtual environments and custom CPython builds
+
+When a virtual environment is used, it may appear that the extension does not work:
+
+```text
+(gdb) bt
+
+#0  0x00007ff2df3d0be3 in __select_nocancel () at ../sysdeps/unix/syscall-template.S:84
+#1  0x0000000000588c4a in ?? ()
+#2  0x00000000004bad9a in PyEval_EvalFrameEx ()
+#3  0x00000000004bfd1f in PyEval_EvalFrameEx ()
+#4  0x00000000004bfd1f in PyEval_EvalFrameEx ()
+#5  0x00000000004b8556 in PyEval_EvalCodeEx ()
+#6  0x00000000004e91ef in ?? ()
+#7  0x00000000004e3d92 in PyRun_FileExFlags ()
+#8  0x00000000004e2646 in PyRun_SimpleFileExFlags ()
+#9  0x0000000000491c23 in Py_Main ()
+#10 0x00007ff2df30f610 in __libc_start_main (main=0x491670 <main>, argc=2, argv=0x7ffc36f11cf8, init=<optimized out>, fini=<optimized out>, 
+    rtld_fini=<optimized out>, stack_end=0x7ffc36f11ce8) at libc-start.c:291
+#11 0x000000000049159b in _start ()
+
+(gdb) py-bt
+
+Undefined command: "py-bt".  Try "help".
+```
+gdb can still follow CPython frames, but the information about `PyEval_EvalCodeEx`
+calls is not available.
+
+If you scroll up the gdb output a bit, you'll see that gdb failed to find
+debugging symbols for the `python` executable:
+
+```shell
+$ gdb -p 2975
+
+GNU gdb (Debian 7.10-1+b1) 7.10
+Copyright (C) 2015 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word".
+Attaching to process 2975
+Reading symbols from /home/rpodolyaka/workspace/venvs/default/bin/python2...(no debugging symbols found)...done.
+```
+
+How is a virtual environment any different? Why did not gdb find the debugging symbols?
+
+First and foremost, the path to the `python` executable is different. Note, that I only
+specified the id of the process to attach to. In this case, gdb will take the executable
+file of the process (i.e. `/proc/$PID/exe` on Linux).
+
+One of the ways to [separate] debugging symbols is to put those into a well-known
+directory (default is `/usr/lib/debug/`, although it's configured using the
+`debug-file-directory` option in gdb). In our case, gdb tried to load
+debugging symbols from `/usr/lib/debug/home/rpodolyaka/workspace/venvs/default/bin/python2` and,
+obviously, did not find anything there.
+
+The solution is simple – explicitly pass the path to the executable when running gdb:
+
+```shell
+$ gdb /usr/bin/python2.7 -p $PID
+```
+
+Thus, gdb will look for debugging symbols in the "right" place -
+`/usr/lib/debug/usr/bin/python2.7`.
+
+It's also worth mentioning that it's possible that debugging symbols for a
+particular executable are identified by a unique `build-id` value stored
+in [ELF] executable headers. E.g. CPython on my Debian machine:
+
+```shell
+$ objdump -s -j .note.gnu.build-id /usr/bin/python2.7
+
+/usr/bin/python2.7:     file format elf64-x86-64
+
+Contents of section .note.gnu.build-id:
+ 400274 04000000 14000000 03000000 474e5500  ............GNU.
+ 400284 8d04a3ae 38521cb7 c7928e4a 7c8b1ed3  ....8R.....J|...
+ 400294 85e763e4
+```
+
+In that case, gdb will look for debugging symbols using the `build-id` value:
+
+```shell
+$ gdb /usr/bin/python2.7
+
+GNU gdb (Debian 7.10-1+b1) 7.10
+Copyright (C) 2015 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from /usr/bin/python2.7...Reading symbols from /usr/lib/debug/.build-id/8d/04a3ae38521cb7c7928e4a7c8b1ed385e763e4.debug...done.
+done.
+```
+This means that it no longer matters how the executable is called:
+`virtualenv` just creates a copy of the specified interpreter executable, thus,
+both executables - the one in `/usr/bin/` and the one in your virtual environment
+will use the very same debugging symbols:
+
+```shell
+$ gdb -p 11150
+
+GNU gdb (ebian 7.10-1+b1) 7.10
+Copyright () 2015 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "how copying"
+and "how warranty" for details.
+This GDB was configured as "86_64-linux-gnu".
+Type "how configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "elp".
+Type "propos word" to search for commands related to "ord".
+Attaching to process 11150
+Reading symbols from /home/rpodolyaka/sandbox/testvenv/bin/python2.7...Reading symbols from
+/usr/lib/debug/.build-id/8d/04a3ae38521cb7c7928e4a7c8b1ed385e763e4.debug...done.
+
+$ ls -la /proc/11150/exe
+lrwxrwxrwx 1 rpodolyaka rpodolyaka 0 Apr 10 15:18 /proc/11150/exe -> /home/rpodolyaka/sandbox/testvenv/bin/python2.7
+```
+
+The first problem is solved, `bt` output now looks much nicer, but `py-bt` command is still
+undefined:
+
+```shell
+(gdb) bt
+
+#0  0x00007f3e95083be3 in __select_nocancel () at ../sysdeps/unix/syscall-template.S:84
+#1  0x0000000000594a59 in floatsleep (secs=<optimized out>) at ../Modules/timemodule.c:948
+#2  time_sleep.lto_priv () at ../Modules/timemodule.c:206
+#3  0x00000000004c524a in call_function (oparg=<optimized out>, pp_stack=0x7ffefb5045b0) at ../Python/ceval.c:4350
+#4  PyEval_EvalFrameEx () at ../Python/ceval.c:2987
+#5  0x00000000004ca95f in fast_function (nk=<optimized out>, na=<optimized out>, n=<optimized out>, pp_stack=0x7ffefb504700, 
+    func=0x7f3e95f78c80) at ../Python/ceval.c:4435
+#6  call_function (oparg=<optimized out>, pp_stack=0x7ffefb504700) at ../Python/ceval.c:4370
+#7  PyEval_EvalFrameEx () at ../Python/ceval.c:2987
+#8  0x00000000004ca95f in fast_function (nk=<optimized out>, na=<optimized out>, n=<optimized out>, pp_stack=0x7ffefb504850, 
+    func=0x7f3e95f78c08) at ../Python/ceval.c:4435
+#9  call_function (oparg=<optimized out>, pp_stack=0x7ffefb504850) at ../Python/ceval.c:4370
+#10 PyEval_EvalFrameEx () at ../Python/ceval.c:2987
+#11 0x00000000004c32e5 in PyEval_EvalCodeEx () at ../Python/ceval.c:3582
+#12 0x00000000004c3089 in PyEval_EvalCode (co=<optimized out>, globals=<optimized out>, locals=<optimized out>) at ../Python/ceval.c:669
+#13 0x00000000004f263f in run_mod.lto_priv () at ../Python/pythonrun.c:1376
+#14 0x00000000004ecf52 in PyRun_FileExFlags () at ../Python/pythonrun.c:1362
+#15 0x00000000004eb6d1 in PyRun_SimpleFileExFlags () at ../Python/pythonrun.c:948
+#16 0x000000000049e2d8 in Py_Main () at ../Modules/main.c:640
+#17 0x00007f3e94fc2610 in __libc_start_main (main=0x49dc00 <main>, argc=2, argv=0x7ffefb504c98, init=<optimized out>, fini=<optimized out>, 
+    rtld_fini=<optimized out>, stack_end=0x7ffefb504c88) at libc-start.c:291
+#18 0x000000000049db29 in _start ()
+
+(gdb) py-bt
+
+Undefined command: "py-bt".  Try "help".
+```
+
+Once again, this is caused by the fact that the `python` binary in a virtual
+environment has a different path. By default, gdb will try to [auto-load]
+Python extensions for a particular object file under debug, if they exist.
+Specifically, gdb will look for `${objfile}-gdb.py` and try to `source` it on
+start:
+
+```text
+(gdb) info auto-load
+
+gdb-scripts:  No auto-load scripts.
+libthread-db:  No auto-loaded libthread-db.
+local-gdbinit:  Local .gdbinit file was not found.
+python-scripts:
+Loaded  Script
+Yes     /usr/share/gdb/auto-load/usr/bin/python2.7-gdb.py
+
+```
+
+If this has not been done, you can always do it manually:
+
+```shell
+(gdb) source /usr/share/gdb/auto-load/usr/bin/python2.7-gdb.py
+```
+
+e.g. if you want to test a new version of the gdb extension shipped with CPython.
+
+[separate]: https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+[ELF]: https://en.wikipedia.org/wiki/Executable_and_Linkable_Format
+[auto-load]: https://sourceware.org/gdb/onlinedocs/gdb/Python-Auto_002dloading.html#set%20auto%2dload%20python%2dscripts
+
+
+## PyPy, Jython, etc
+
+The described debugging technique is only feasible for the CPython interpreter,
+as the gdb extension is specifically written to introspect the state
+of CPython internals (e.g. `PyEval_EvalFrameEx` calls).
+
+For [PyPy] there is an open [issue] on Bitbucket, where it was proposed to
+provide integration with gdb, but looks like the attached patches have not
+been merged yet and the person who wrote those lost interest in this.
+
+For [Jython] you could probably use standard tools for debugging of JVM
+applications, e.g. [VisualVM].
+
+[issue]: https://bitbucket.org/pypy/pypy/issues/1204/gdb-hooks-for-debugging-pypy
+[PyPy]: http://pypy.org/
+[Jython]: http://www.jython.org/
+[VisualVM]: http://visualvm.java.net/
+
+
+Conclusion
+----------
+
+gdb is a powerful tool that allows one to debug complex problems with
+crashing or hanging CPython processes, as well as Python code that does
+calls to native libraries. On modern Linux distros debugging CPython processes
+with gdb must be as simple as installing of debugging symbols for the
+concrete interpreter build, although there are a few known gotchas, especially
+when virtual environments are used.

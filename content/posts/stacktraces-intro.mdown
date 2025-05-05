@@ -1,0 +1,21 @@
++++
+title = "Stack traces"
+date = 2025-05-01
+draft = true
++++
+
+# Stack traces
+
+A *stack trace* (also known as *backtrace* or *traceback*) is a versatile tool for troubleshooting
+of computer programs. From logging to profiling and debugging, stack traces are widely used to reason
+about how a particular event of interest has happened, where the execution time is spent, etc.
+Understanding how stack traces work for "native" code is quite a journey to the wonderful world
+of systems programming.
+
+> [!NOTE]
+> Examples in this post use X86-64 ELF binaries on Linux, but other CPU architectures and operating
+systems are very similar.
+
+## CPU
+
+## Frame pointers

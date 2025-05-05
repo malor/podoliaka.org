@@ -1,0 +1,57 @@
+baseURL = "https://podoliaka.org/"
+languageCode = "en-us"
+title = "Roman Podoliaka's blog"
+theme = "hugo-coder"
+
+[markup.highlight]
+  style = "nord"
+
+[params]
+  author = "Roman Podoliaka"
+  description = "Roman Podoliaka's personal blog"
+  keywords = "blog,developer,personal"
+  since = 2013
+  colorScheme = "auto"
+  avatarURL = "images/ava.png"
+
+[permalinks]
+  posts = '/:year/:month/:day/:contentbasename/'
+
+[[menu.main]]
+  name = "Posts"
+  weight = 1
+  url  = "posts/"
+[[menu.main]]
+  name = "RSS"
+  weight = 2
+  url = "index.xml"
+[[menu.main]]
+  name = "About"
+  weight = 3
+  url = "about/"
+[[menu.main]]
+  name = "Talks"
+  weight = 4
+  url = "talks/"
+[[menu.main]]
+  name = "CV"
+  weight = 5
+  url = "https://www.dropbox.com/s/j8n1yd86dn00a41/cv.pdf?dl=1"
+
+[[params.social]]
+  name = "Github"
+  icon = "fa-brands fa-github fa-2x"
+  weight = 1
+  url = "https://github.com/malor"
+
+[[params.social]]
+  name = "Linkedin"
+  icon = "fa-brands fa-linkedin fa-2x"
+  weight = 2
+  url = "https://www.linkedin.com/in/podoliaka/"
+
+[[params.social]]
+  name = "Mastodon"
+  icon = "fa-brands fa-mastodon fa-2x"
+  weight = 3
+  url = "https://techhub.social/@rpodoliaka"

@@ -1,0 +1,193 @@
++++
+title = "The perils of temporary object lifetimes in C++"
+date = 2023-11-21
+draft = false
+tags = ["c++"]
++++
+
+The other day my junior colleague asked me to help him troubleshoot a failing unit test: the
+actual value of a protocol buffer string field did not match[^1] the expected value, and he
+couldn't figure out why. I'm not allowed to share that code, but it can be summarized using
+this contrived example:
+
+```cpp
+#include <iostream>
+#include <string>
+
+std::string foo() {
+    return "Hello, programmer!";
+}
+
+int main() {
+    std::string_view bar = {foo()};
+    std::cout << bar << std::endl;
+
+    return 0;
+}
+```
+
+A seasoned C++ programmer will immediately spot the problem, but someone who have only used a
+memory-safe language like Java or Python before will be baffled why a seemingly trivial program
+above may or may not print the string `"Hello, programmer!\n"` depending on the chosen level of
+optimizations, the version of a compiler, operating system, etc.
+
+The issue, of course, is that `foo()` returns a _temporary_ object whose lifetime ends too early:
+
+* unlike `std::string`, `std::string_view` does _not_ allocate and own a dynamic array of `char`s;
+  instead, it _references_ a contiguous sequence of `char`s somewhere in main memory. In this case,
+  that sequence is a dynamic array owned by a temporary `std::string` object
+
+* this temporary object is destroyed right after initialization of a `std::string_view` value, and
+  so the newly constructed `std::string_view` object immediately points to a memory region that
+  has already been freed and, potentially, reused for storing something else
+
+How would a junior programmer know they made a mistake like that? Would the compiler be able to help?
+I tried the latest versions of clang++ and g++ available in Arch Linux, but neither complained about
+the code above:
+
+```shell
+$ clang++ --version
+clang version 16.0.6
+Target: x86_64-pc-linux-gnu
+Thread model: posix
+InstalledDir: /usr/bin
+$ clang++ example.cpp -o example -Wall -Werror -pedantic -std=c++17
+$
+
+$ g++ --version
+g++ (GCC) 13.2.1 20230801
+Copyright (C) 2023 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+$ g++ example.cpp -o example -Wall -Werror -pedantic -std=c++17
+$
+```
+
+Interestingly, replacing `std::string_view bar = {foo()};` with `std::string_view bar = foo();` makes
+the difference, and clang++ is now able to generate a warning (that can be turned into an error if you
+compile the code with `-Werror`):
+
+```shell
+$ clang++ example.cpp -o example -Wall -Werror -pedantic -std=c++17
+example.cpp:9:28: error: object backing the pointer will be destroyed at the end of the full-expression [-Werror,-Wdangling-gsl]
+    std::string_view bar = foo();
+                           ^~~~~
+1 error generated.
+```
+
+[C++ initialization rules](https://en.cppreference.com/w/cpp/language/initialization) are mind-boggling, but
+it looks like aggregate initialization somehow throws clang++ off, while diagnostics in g++ are even weaker.
+
+Not all hope is lost, though. While it might be hard to detect this issue at _compile_ time, it is certainly
+possible to do so at _runtime_. [AddressSanitizer](https://github.com/google/sanitizers/wiki/AddressSanitizer)
+is a huge step forward and truly is a must have if you write C/C++ these days. Passing `-fsanitize=address` when
+compiling binaries using clang or GCC will add the necessary instrumentation to detect such errors, for example:
+
+```shell
+$ clang++ example.cpp -o example -Wall -Werror -pedantic -std=c++17 -g -Og -fsanitize=address -fno-omit-frame-pointer
+$ ./example
+=================================================================
+==795293==ERROR: AddressSanitizer: heap-use-after-free on address 0x603000000040 at pc 0x55a69bd7cd75 bp 0x7ffee39bfff0 sp 0x7ffee39bf7b0
+READ of size 18 at 0x603000000040 thread T0
+    #0 0x55a69bd7cd74 in __interceptor_fwrite.part.0 asan_interceptors.cpp.o
+    #1 0x7f17373489e4 in std::basic_streambuf<char, std::char_traits<char>>::sputn(char const*, long) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/streambuf:458:28
+    #2 0x7f17373489e4 in void std::__ostream_write<char, std::char_traits<char>>(std::basic_ostream<char, std::char_traits<char>>&, char const*, long) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/bits/ostream_insert.h:53:52
+    #3 0x7f17373489e4 in std::basic_ostream<char, std::char_traits<char>>& std::__ostream_insert<char, std::char_traits<char>>(std::basic_ostream<char, std::char_traits<char>>&, char const*, long) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/bits/ostream_insert.h:104:18
+    #4 0x55a69be6466d in std::basic_ostream<char, std::char_traits<char>>& std::operator<<<char, std::char_traits<char>>(std::basic_ostream<char, std::char_traits<char>>&, std::basic_string_view<char, std::char_traits<char>>) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/string_view:762:14
+    #5 0x55a69be6466d in main /home/malor/sandbox/example.cpp:10:15
+    #6 0x7f1737045ccf  (/usr/lib/libc.so.6+0x27ccf) (BuildId: 8bfe03f6bf9b6a6e2591babd0bbc266837d8f658)
+    #7 0x7f1737045d89 in __libc_start_main (/usr/lib/libc.so.6+0x27d89) (BuildId: 8bfe03f6bf9b6a6e2591babd0bbc266837d8f658)
+    #8 0x55a69bd2b0d4 in _start (/home/malor/sandbox/example+0x1e0d4) (BuildId: c4ea059bae95830d2bf5f9b4963447a6f11ab751)
+
+0x603000000040 is located 0 bytes inside of 19-byte region [0x603000000040,0x603000000053)
+freed by thread T0 here:
+    #0 0x55a69be61fba in operator delete(void*) (/home/malor/sandbox/example+0x154fba) (BuildId: c4ea059bae95830d2bf5f9b4963447a6f11ab751)
+    #1 0x55a69be6464e in std::__new_allocator<char>::deallocate(char*, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/new_allocator.h:168:2
+    #2 0x55a69be6464e in std::allocator<char>::deallocate(char*, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/allocator.h:210:25
+    #3 0x55a69be6464e in std::allocator_traits<std::allocator<char>>::deallocate(std::allocator<char>&, char*, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/alloc_traits.h:516:13
+    #4 0x55a69be6464e in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::_M_destroy(unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.h:289:9
+    #5 0x55a69be6464e in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::_M_dispose() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.h:283:4
+    #6 0x55a69be6464e in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::~basic_string() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.h:792:9
+    #7 0x55a69be6464e in main /home/malor/sandbox/example.cpp:9:28
+    #8 0x7f1737045ccf  (/usr/lib/libc.so.6+0x27ccf) (BuildId: 8bfe03f6bf9b6a6e2591babd0bbc266837d8f658)
+
+previously allocated by thread T0 here:
+    #0 0x55a69be61522 in operator new(unsigned long) (/home/malor/sandbox/example+0x154522) (BuildId: c4ea059bae95830d2bf5f9b4963447a6f11ab751)
+    #1 0x55a69be645b1 in std::__new_allocator<char>::allocate(unsigned long, void const*) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/new_allocator.h:147:27
+    #2 0x55a69be645b1 in std::allocator<char>::allocate(unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/allocator.h:198:32
+    #3 0x55a69be645b1 in std::allocator_traits<std::allocator<char>>::allocate(std::allocator<char>&, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/alloc_traits.h:482:20
+    #4 0x55a69be645b1 in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::_S_allocate(std::allocator<char>&, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.h:126:16
+    #5 0x55a69be645b1 in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::_M_create(unsigned long&, unsigned long) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.tcc:155:14
+    #6 0x55a69be645b1 in void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::_M_construct<char const*>(char const*, char const*, std::forward_iterator_tag) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.tcc:225:14
+    #7 0x55a69be645b1 in std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>::basic_string<std::allocator<char>>(char const*, std::allocator<char> const&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/13.2.1/../../../../include/c++/13.2.1/bits/basic_string.h:639:2
+    #8 0x55a69be645b1 in foo[abi:cxx11]() /home/malor/sandbox/example.cpp:5:12
+    #9 0x55a69be645b1 in main /home/malor/sandbox/example.cpp:9:29
+    #10 0x7f1737045ccf  (/usr/lib/libc.so.6+0x27ccf) (BuildId: 8bfe03f6bf9b6a6e2591babd0bbc266837d8f658)
+
+SUMMARY: AddressSanitizer: heap-use-after-free asan_interceptors.cpp.o in __interceptor_fwrite.part.0
+Shadow bytes around the buggy address:
+  0x602ffffffd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x602ffffffe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x602ffffffe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x602fffffff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x602fffffff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x603000000000: fa fa 00 00 00 fa fa fa[fd]fd fd fa fa fa fa fa
+  0x603000000080: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x603000000100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x603000000180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x603000000200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x603000000280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==795293==ABORTING
+```
+
+AddressSanitizer detected the issue at runtime and immediately aborted execution of the program.
+Its output will contain the following information:
+
+* the type of a memory error and where it happened. In this case, it is `heap-use-after-free`[^2] that
+  is triggered inside `operator<<()` which tries to access already freed memory through a dangling pointer
+
+* where in the code this memory block was previously allocated and deallocated
+
+* AddressSanitizer's view of main memory
+  ([read](https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm) about how AddressSanitizer
+  works to make sense of this output)
+
+(note the use of `-g -Og -fno-omit-frame-pointer` to produce detailed stack traces with source code line numbers).
+
+The catch is that the faulty code path must be triggered in order for AddressSanitizer to do its job.
+Hey, but that's why you should always write tests!
+
+It _is_ amazing to me how easy it is to make a mistake like that in C++ compared to programming languages
+with automatic memory management, or programming languages like Rust that can detect those at _compile_ time.
+This also reminds me of how old I am: we now have a whole new generation of programmers for whom automatic memory
+management is the norm, and those pesky C++ object lifetime rules are some anachronisms.
+
+[^1]: In addition to the test failure, there was a warning about protocol buffer string serialization detecting
+an invalid UTF-8 sequence. When I pointed that out to my colleague (to hint that we were reading garbage memory
+somehow), it didn't trigger any reaction. I now realize that we live in the world where UTF-8 has officially
+won and it is now universally associated with the term Unicode or even "text" -- no one cares what encoding
+is used and how it works, as it's all UTF-8 these days.
+
+[^2]: The string value in the example above was carefully chosen to trigger this specific kind of a memory error.
+Modern implementations of `std::string` will store shorter strings on the stack, and heap won't be used at all.
+This does not change the outcome, though: either way `std::string_view` would be referencing a memory block that
+might already be used for storing something else. AddressSanitizer would detect that as `stack-use-after-scope`.

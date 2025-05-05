@@ -1,0 +1,35 @@
+About me
+========
+
+Hey! I'm Roman, a software engineer from Ukraine who currently lives in Ireland.
+
+My programming language of choice is Python, as it allows me to be efficient and easily
+express my thoughts. I used to do some C / C++ / Java programming in the past and keep using
+those languages, but usually only when I need to read or modify someone else's code.
+I'm also a big fan of Rust and Clojure and use them occasionally for various pet projects.
+
+My main areas of expertise are:
+
+* Troubleshooting
+
+* System programming
+
+* Databases and storage systems in general
+
+
+Short bio:
+----------
+
+* __Name__: Roman Podoliaka
+* __Nickname__: malor
+* __Location__: Dublin, Ireland
+
+
+Contact
+-------
+
+If you want to reach out to me, you're welcome to send an [E-mail] or follow me on [Mastodon], or [GitHub]
+
+[E-mail]: mailto:roman.podoliaka@gmail.com
+[Mastodon]: https://techhub.social/@rpodoliaka
+[GitHub]: https://github.com/malor
