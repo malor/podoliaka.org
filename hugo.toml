@@ -55,3 +55,7 @@ theme = "hugo-coder"
   icon = "fa-brands fa-mastodon fa-2x"
   weight = 3
   url = "https://techhub.social/@rpodoliaka"
+
+[caches]
+  [caches.images]
+    dir = ':cacheDir/images'
