@@ -105,11 +105,20 @@ it's always a good idea to use a profiler instead of trying to guess.
 $ perf record -F 99 --call-graph dwarf target/release/newlines -- \
      /home/malor/sandbox/1brc/measurements.txt
 ```
+> perf is a [statistical profiler](https://en.wikipedia.org/wiki/Profiling_(computer_programming)#Statistical_profilers)
+that expects you to specify the sampling rate. Higher rate allows for finer resolution but also
+increases the overhead. By choosing an «odd» value like 99 samples per second (instead of 100) we
+can avoid accidental alignment with some regular activity inside the OS which would skew the
+results. E.g. if there was a periodic task that performs memory bookkeeping every 10ms, every
+sample we take would see it.
 
-> The magic number `99` is just a way to avoid the sampling rate accidentally align with the OS internal timers.
-
-> `--call-graph dwarf` is the secret sauce for getting stack traces when the frame pointers
-optimization is enabled (it is by default). The code has to be compiled with debug symbols enabled.
+> The simplest and most reliable way to obtain a native code stack trace is to use
+[frame pointers](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html)
+(`--call-graph fp`), but modern compilers omit those to save a few CPU cycles per function call.
+Alternatively, you can compile the code with DWARF debug symbols enabled and let perf use that
+information to unwind the stack (`--call-graph dwarf`). Profiling overhead will be higher, but
+outside of profiling the code will run a little bit faster (having frame pointers enabled slows
+down execution by a [single-digit percentage](https://fedoraproject.org/wiki/Changes/fno-omit-frame-pointer)).
 
 [FlameGraph](https://github.com/brendangregg/FlameGraph) is a popular way to visualize this data:
 
@@ -123,18 +132,21 @@ optimization is enabled (it is by default). The code has to be compiled with deb
 
 A few things stand out in the collected CPU profile:
 
-* A lot of time is spent on **decoding UTF-8**. This is the result of using [read_line()](https://doc.rust-lang.org/stable/std/io/trait.BufRead.html#method.read_line):
+* A lot of time is spent on **decoding UTF-8** (`core::str::validations::run_utf8_validation`).
+This is the result of using [read_line()](https://doc.rust-lang.org/stable/std/io/trait.BufRead.html#method.read_line):
 not only will it split the input by the new line byte, but, because the output is a [String](https://doc.rust-lang.org/std/string/struct.String.html),
 it also has to validate the UTF-8 byte sequence, which is completely redundant in our case.
 
-* The next big chunk of work is **copying the data**. If you think about it, buffered I/O provided
-by [BufReader](https://doc.rust-lang.org/std/io/struct.BufReader.html) does not really help us here;
-it only adds one additional copy between the internal buffer and the output buffer that we have to
-provide as one of `read_line()`'s arguments.
+* The next big chunk of work is **copying the data** (`__memcpy_avx512_unaligned_erms`).
+[BufReader](https://doc.rust-lang.org/std/io/struct.BufReader.html) normally allows to reduce the
+overhead from making repeated syscalls by buffering the data, so that every read operation does _not_
+need to go to the OS. But using BufReader incurs one additional data copy from its own internal buffer
+to the final destination in memory specified in the `read_line()` call.
 
 * Finally, while somewhat hard to see in the flame graph (because of how inefficient our naive
 implementation is!), **syscall** overhead _is_ noticeable, and we clearly spend more time in kernel
-space than *wc*.
+space than *wc* (all the «orange» call frames in the flame graph, and the value of «sys» in the
+output of *time* previously).
 
 How can we address those issues?
 
@@ -430,10 +442,9 @@ by a file, there are two possible outcomes:
   2. If the referenced memory page already is in main memory, the read succeeds. No context
      switches or copies are performed.
 
-> If the system goes under memory pressure, the kernel will automatically evict the memory pages
-used by memory mapped files — because the data is persisted on storage devices, it can always be
-loaded again on request. For _anonymous_ memory allocations (i.e. those done using `malloc()`
-or `new`), this is only possible if the system has a configured «swap» file/partition.
+You don't need to hold the entirety of a file in memory all at once: the kernel will automatically
+load the pages as they are accessed, and evict the unused pages to reclaim space when running close
+to the limit of physical memory.
 
 The programming interface is fairly straightforward:
 
@@ -563,21 +574,20 @@ Executed in  940.43 millis    fish           external
    sys time  506.71 millis  835.00 micros  505.87 millis
 ```
 
-What the heck? The code is *slower* now! Profiling results are interesting: we spend surprisingly
-long in kernel space on what looks like memory page accounting. Worse than that, almost half
-of that overhead comes from the cleanup performed by `munmap()` _after_ the main computation is
-performed.
+What the heck? The code is *slower* now! Profiling results are interesting: we spend a surprisingly
+long time in kernel space on what looks like memory page accounting. Worse than that, almost half
+of that overhead comes from the cleanup performed by `munmap()` _after_ the main computation
+completes.
 
 ![mmap](/posts/newlines/mmap.svg)
 
-For a toy example like this, we can certainly treat cleanup as optional and just let the kernel
-deal with it when the process is terminated, but that won't really move the needle.
+What can possibly be the reason?
 
 # We need to go deeper
 
 To explain what we are seeing here, we might want to use a different perf command that counts
-various CPU events. There are many, but, luckily for us, `stat` has a convenience flag that selects
-the «important» ones.
+various CPU events. There are many, but, luckily for us, `stat` has a convenience flag `-d`
+(can be repeated multiple times to increase the number of metrics) that selects the «important» ones.
 
 ```shell
 > perf stat -d -d -d target/release/newlines /home/malor/sandbox/1brc/measurements.txt
@@ -612,7 +622,8 @@ the «important» ones.
 ```
 
 Interpreting these numbers can be tricky. What looks interesting here is the high number of (data)
-[TLB](https://en.wikipedia.org/wiki/Translation_lookaside_buffer) load misses and page faults:
+[TLB](https://en.wikipedia.org/wiki/Translation_lookaside_buffer) load misses (`dTLB-load-misses`)
+and page faults (`page-faults`):
 
 * TLB is a CPU cache that speeds up translation of virtual to physical memory addresses. If this
 mapping is _not_ in the cache, the CPU has to do extra work to load this mapping from the main
@@ -623,15 +634,14 @@ page which is not in the physical memory at the moment. The corresponding page m
 swapped out to reclaim space, or it may not have been (lazily) loaded yet. In our case, we _know_
 that the data already is in kernel's page cache, so all the page faults are so called «minor» faults
 which don't trigger any reads from a storage device, but the CPU still triggers an interrupt and
-starts executing the kernel handler which will update the task memory page mapping.
+starts executing the kernel handler which will update the task's memory page mapping.
 
-Either of the two _could_ slow down execution of our program, but it's unclear to what extent
-and whether it could explain the timings we are seeing. Luckily, there is an easy way to rule
-out page faults: instead of loading the memory pages lazily on the first access, we can ask
-`mmap()` to do that eagerly right away by passing the `MAP_POPULATE` flag (this does not reduce
-the total amount of work done by the kernel but it removes user/kernel space switches).
+To rule out the overhead of interrupts we can ask `mmap()` to eagerly process all the pages
+by passing the `MAP_POPULATE` flag. The kernel still has to do the same amount of internal
+memory page bookkeeping, but now it can all of it once ahead of the main computation.
 
-With that, page faults are gone, but the code is even slower!
+With that, page faults are gone (the value of `page-faults` is now miniscule), but the code is
+even slower!
 
 ```shell
 > perf stat -d -d -d target/release/newlines /home/malor/sandbox/1brc/measurements.txt
@@ -690,13 +700,14 @@ background; it just needs advice on what regions of memory to consider. So let's
 
 [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) is a system call that allows us
 to tell the kernel how the memory mapping should be used. There are various options to choose from,
-but the ones we are interested in here are the following three:
+but the ones we care about are the following three:
 
 * `MADV_SEQUENTIAL`: Expect pages to be referenced in the sequential order. This is what enables
 page prefetch to amortize page fault overhead.
 * `MADV_HUGEPAGE`: Enable Transparent Huge Pages for pages in the specified range. This is what
 makes the kernel consider pages in this range suitable for collapsing. It may or may not be required
-depending on the system configuration.
+depending on the system configuration (only needed if `/sys/kernel/mm/transparent_hugepage/enabled`
+is set to `madvise` instead of `always`).
 * `MADV_COLLAPSE`: Perform a best-effort synchronous collapse of the native pages mapped by the
 memory range into Transparent Huge Pages.
 
@@ -738,11 +749,13 @@ impl MMap {
 }
 ```
 From my experiments, `MADV_COLLAPSE` is the «secret sauce» required to make the kernel use huge pages
-consistently. While the documentation explicitly says that the `madvise()` operates on the *current*
-state of memory, on Linux 6.16 the effects persist across multiple program runs (not only that, it
-also makes *wc*, which does not use memory mapped I/O, run faster!).
+consistently. While the documentation explicitly says that `madvise()` operates on the *current* state
+of memory, at least on Linux 6.16 the effects persist across multiple program runs: the page cache will
+use huge pages for the contents of a file that was previously mapped that way. Curiously, this also
+makes *wc*, which does not use memory mapped IO, run faster (presumably, because page access and copying
+data become more efficient).
 
-At last, the time spent in kernel space is down to the bare minimum and all CPU effort is spent
+At last, the time spent in kernel space is down to the bare minimum, and all the CPU effort is spent
 on the actual computation. 
 
 ```shell
@@ -755,7 +768,7 @@ Executed in  278.52 millis    fish           external
 ```
 
 perf indicates a significant reduction in the number of cycles, instructions, page faults, and
-TLB load misses across the board (which makes sense as we now have 512x fewer 2 MiB memory pages):
+TLB load misses across the board (which makes sense, as we now have 512x fewer 2-MiB memory pages):
 
 ```shell
 > perf stat -d -d -d target/release/newlines /home/malor/sandbox/1brc/measurements.txt
@@ -789,56 +802,62 @@ TLB load misses across the board (which makes sense as we now have 512x fewer 2 
        0.013880000 seconds sys
 ```
 
-Interestingly, the time spent in user space *increased* compared to the version of this program
+Notably, the time spent in user space *increased* compared to the version of this program
 that used `read()` syscalls and performed an extra copy of data from kernel space to user space.
-My interpretation of this is that:
+My interpretation is that:
 
 * One way or the other we need to load the data from main memory at least once.
 * When the syscalls interface is used, this load is performed when the data is copied from kernel
 space to user space, and then the data is highly likely to remain in the CPU cache, so the time
 spent is attributed to the kernel.
-* When the memory mapped interface is used, the CPU instruction which needs to load the data
-(in our case, the SIMD integer comparison) will have to bear the cost.
+* When the memory mapped interface is used, the CPU instruction which needs the data (in our case,
+the SIMD integer comparison) will have to bear the cost.
 
 # Are we there yet?
 
-As we work on those performance optimizations, one interesting question to ask is how do we know
-that we have found the optimum solution? To answer that, we need to think about what the «speed of
-light» of this program would be:
+As we work on those performance optimizations, one question to ask is how do we know that we have
+found the optimum solution? To answer that, we need to think about what the «speed of light» of this
+program would be:
 
 * We know that we are _not_ reading data from persistent storage, so we are not limited by SSD/HDD throughput.
 * Even if our CPU was infinitely fast, we would still need to load the data from main memory. Therefore,
-the ultimate limiting factor should be *memory bandwidth*.
+the ultimate limiting factor must be *memory bandwidth*.
 
-I've used [pmbw](https://panthema.net/2013/pmbw/) to empirically measure the memory bandwidth on
-my machine. This little tool performs a series of tests to understand how the throughput of reads
-(or writes) scales with the number of threads and the size of input data. The results look
-quite interesting:
+I've used [pmbw](https://panthema.net/2013/pmbw/) to empirically measure memory bandwidth on my
+machine. This little tool performs a series of tests to understand how throughput of reads (or
+writes) scales with the number of threads and the size of input data.
 
-* There are multiple inflection points that correspond to the next array size that no longer fits
-in L1, L2 or L3 CPU cache.
+E.g. let's run the test which performs 256-bit sequential reads from byte arrays of increasing size,
+and measure the resulting memory bandwidth as we change the number of threads that perform these
+reads in parallel. The results look quite intriguing:
 
-* When the total data corpus is fully in the CPU cache (regardless of the level), memory bandwidth
-scales linearly with the number of threads (which makes sense, given that L1 and L2 caches on Ryzen
-are per CPU core).
-
-* Once the CPU has to fetch data from main memory, though, it becomes the bottleneck. And not
-only that, but we also get **no benefit whatsoever from running more than one thread**.
+> Each line in this graph represents an independent test run with the number of parallel threads set
+to `p`. In my case, `p` varies from 1 to 16, which is the maximum number of hyper-threads on the 8-core
+Ryzen 7700 CPU.
 
 ![pmbw](/posts/newlines/pmbw.png)
 
+* There are multiple inflection points that correspond to the next array size which no longer fits
+in the L1, the L2 or the L3 CPU cache.
+
+* When the total data corpus is fully in the CPU cache (regardless of the level), memory bandwidth
+scales linearly with the number of threads.
+
+* Once CPU has to fetch data from main memory, though, memory bandwidth becomes the bottleneck.
+And not only that, but we also get **no benefit whatsoever from running more than one thread**.
+
 What's also interesting about these results, is that when the data is too big to fit in any level
-of the CPU cache, the observed memory bandwidth eventually converges around the value we are seeing
-in our program counting new lines (`13,795,355,507 bytes / 0.280 seconds ~= 46 GiB/s`):
+of the CPU cache, the total memory bandwidth eventually converges around the value we are seeing
+in our program counting new lines (13,795,355,507 bytes / 0.280 seconds ~= 46 GiB/s):
 
 ![pmbw (single thread)](/posts/newlines/pmbw-single-thread.png)
 
 Memory bandwidth is a shared resource, and, apparently, this is the best RAM can do on my machine.
-The computation is so simple that CPU is able to do more, but we can't feed the data fast
-enough to keep it busy. With just one thread we've managed to saturate the memory bus.
+The computation is so simple that CPU is able to do more, but we can't feed the data fast enough to
+keep it busy. With just one thread we've managed to saturate the memory bus.
 
 Curiously, *theoretical* throughput of these DDR5-4800 DIMM modules is supposed to be
-`2 channels * (4800 * 10^6) transfers/s * 8 bytes ~= 71.5 GiB/s`, but somehow what we
+2 channels * (4800 * 10^6) transfers/s * 8 bytes ~= 71.5 GiB/s, but, somehow, what we
 see in practice is much lower than that.
 
 # Conclusion
