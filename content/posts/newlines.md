@@ -35,8 +35,8 @@ of the generated file was 13,795,355,507 bytes.
 Presumably, we would need to read each line of the input at least once. How fast can this possibly
 be done on a modern computer?
 
-**For the purpose of this post, let's focus on _even simpler_ problem and go through the steps of
-optimizing a program that only counts the new line bytes.**
+**For the purpose of this post, let's focus on _even simpler_ problem than The One Billion Row
+Challenge and go through the steps of optimizing a program that only counts the new line bytes.**
 
 # Setting a target to beat
 
@@ -132,21 +132,19 @@ down execution by a [single-digit percentage](https://fedoraproject.org/wiki/Cha
 
 A few things stand out in the collected CPU profile:
 
-* A lot of time is spent on **decoding UTF-8** (`core::str::validations::run_utf8_validation`).
+* A lot of time is spent on **decoding UTF-8** (`core::str::converts::from_utf8`).
 This is the result of using [read_line()](https://doc.rust-lang.org/stable/std/io/trait.BufRead.html#method.read_line):
 not only will it split the input by the new line byte, but, because the output is a [String](https://doc.rust-lang.org/std/string/struct.String.html),
 it also has to validate the UTF-8 byte sequence, which is completely redundant in our case.
 
-* The next big chunk of work is **copying the data** (`__memcpy_avx512_unaligned_erms`).
+* The next big chunk of work is **copying the data** (`core::ptr::copy_nonoverlapping`).
 [BufReader](https://doc.rust-lang.org/std/io/struct.BufReader.html) normally allows to reduce the
 overhead from making repeated syscalls by buffering the data, so that every read operation does _not_
 need to go to the OS. But using BufReader incurs one additional data copy from its own internal buffer
 to the final destination in memory specified in the `read_line()` call.
 
-* Finally, while somewhat hard to see in the flame graph (because of how inefficient our naive
-implementation is!), **syscall** overhead _is_ noticeable, and we clearly spend more time in kernel
-space than *wc* (all the «orange» call frames in the flame graph, and the value of «sys» in the
-output of *time* previously).
+* Finally, **syscall** overhead _is_ noticeable (all the «orange» call frames), and we clearly spend
+a significant portion of time in kernel space.
 
 How can we address those issues?
 
@@ -154,7 +152,8 @@ How can we address those issues?
 
 The first issue we identified is trivial to fix: we just need to swap `String` for `Vec<u8>`, and
 use [read_until()](https://doc.rust-lang.org/std/io/trait.BufRead.html#method.read_until) instead
-of `read_line()`. That's what already happens internally; we are simply removing the redundant UTF-8 validation.
+of `read_line()`. That's what already happens internally; we are simply removing redundant UTF-8
+validation.
 
 ```rust
 fn count_lines(path: &str) -> Result<usize> {
@@ -210,9 +209,9 @@ fn count_lines(path: &str) -> Result<usize> {
     Ok(lines)
 }
 ```
-
 > Readers might question the choice of the iterators API for counting new lines, but the reality is
-that the compiled version of this code is just as fast as a handwritten loop, so it makes no difference.
+> that this code produces the exact same assembly as a handwritten loop and runs just as fast, so
+> it makes no difference.
 
 This is still slow, but the performance win from removing one extra copy in user space is impressive!
 
@@ -274,7 +273,8 @@ What's its secret then? perf to the rescue!
 
 The *wc* binary shipped by Arch Linux is built with the frame pointer optimization
 enabled and comes without DWARF debug symbols, but the good news is that perf now supports
-[debuginfod]({{< relref "debuginfod.md" >}}), so it's easy to get a meaningful CPU profile.
+[debuginfod]({{< relref "debuginfod.md" >}}), so it's easy to get a meaningful CPU profile
+without rebuilding the binary from the source code.
 
 ```shell
 > perf record -F 99 --call-graph dwarf \
